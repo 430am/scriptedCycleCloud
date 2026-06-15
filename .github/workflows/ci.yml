@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - "scripts/**"
+      - ".github/workflows/ci.yml"
+      - ".tflint.hcl"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.0
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init (backend=false)
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: tflint
+        working-directory: ${{ github.workspace }}
+        run: |
+          tflint --init --config="${{ github.workspace }}/.tflint.hcl"
+          tflint --recursive --config="${{ github.workspace }}/.tflint.hcl"

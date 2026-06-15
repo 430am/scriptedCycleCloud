@@ -1,0 +1,92 @@
+#!/bin/bash
+# Rendered by Terraform templatefile(). Run on the CycleCloud server VM AFTER
+# install-cyclecloud.sh.tftpl. Pulls the admin password + SSH public key from
+# Key Vault via the VM's system-assigned MI, bypasses the web wizard, then
+# registers the subscription with managed-identity auth.
+#
+# ponytail: account_data.json + `cyclecloud initialize` + `cyclecloud account
+# create` are the documented bootstrap path. Exact CLI flag set varies slightly
+# between cyclecloud8 minor versions; if a flag is rejected on first apply,
+# update this template against the installed `cyclecloud --help`.
+set -euo pipefail
+
+DONE_MARKER=/var/lib/cc-register.done
+if [[ -f "$DONE_MARKER" ]]; then
+  echo "register already complete; exiting"
+  exit 0
+fi
+
+KV_NAME="${kv_name}"
+ADMIN_USER="${admin_username}"
+SUBSCRIPTION_ID="${subscription_id}"
+TENANT_ID="${tenant_id}"
+LOCATION="${location}"
+LOCKER_SA="${locker_sa_name}"
+LOCKER_CONTAINER="${locker_container_name}"
+APPLICATION_NAME="${application_name}"
+
+# 1. Auth with the VM's system MI.
+az login --identity --allow-no-subscriptions
+
+# 2. Wait for KV RBAC + private-DNS propagation, then read secrets.
+for i in $(seq 1 30); do
+  if az keyvault secret show --vault-name "$KV_NAME" --name cyclecloud-admin-password > /dev/null 2>&1; then
+    break
+  fi
+  echo "waiting for KV access ($i/30)"
+  sleep 10
+done
+
+ADMIN_PASSWORD=$(az keyvault secret show --vault-name "$KV_NAME" --name cyclecloud-admin-password --query value -o tsv)
+
+# 3. Pre-seed account_data.json so the first-run web wizard is skipped.
+mkdir -p /opt/cycle_server/config/data
+cat > /opt/cycle_server/config/data/account_data.json <<JSON
+[
+  {
+    "AdType": "Application.Setting",
+    "Name": "cycleserver.installation.complete",
+    "Value": true,
+    "Description": "Marks the initial installation as complete"
+  },
+  {
+    "AdType": "AuthenticatedUser",
+    "Name": "$ADMIN_USER",
+    "RawPassword": "$ADMIN_PASSWORD",
+    "Superuser": true
+  }
+]
+JSON
+
+systemctl restart cycle_server
+
+# 4. Wait for the API to come back up.
+for i in $(seq 1 60); do
+  if curl -ksf https://localhost > /dev/null 2>&1; then break; fi
+  echo "waiting for cycle_server API ($i/60)"
+  sleep 5
+done
+
+# 5. Initialize the local CLI profile.
+cyclecloud initialize \
+  --batch \
+  --force \
+  --name "$APPLICATION_NAME" \
+  --url "https://localhost" \
+  --username "$ADMIN_USER" \
+  --password "$ADMIN_PASSWORD" \
+  --verify-ssl false
+
+# 6. Register the subscription with MSI auth + the dedicated locker SA.
+cyclecloud account create \
+  --name "$APPLICATION_NAME" \
+  --subscription-id "$SUBSCRIPTION_ID" \
+  --tenant-id "$TENANT_ID" \
+  --location "$LOCATION" \
+  --use-msi \
+  --default-locker "$LOCKER_SA" \
+  --default-locker-container "$LOCKER_CONTAINER"
+
+mkdir -p "$(dirname "$DONE_MARKER")"
+touch "$DONE_MARKER"
+echo "register complete"

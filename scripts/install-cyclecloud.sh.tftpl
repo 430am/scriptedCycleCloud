@@ -1,0 +1,52 @@
+#!/bin/bash
+# Rendered by Terraform templatefile(); installed onto the CycleCloud server
+# VM by an azurerm_virtual_machine_run_command resource. Idempotent: re-runs
+# exit early when the done marker is present.
+set -euo pipefail
+
+DONE_MARKER=/var/lib/cc-install.done
+if [[ -f "$DONE_MARKER" ]]; then
+  echo "install already complete; exiting"
+  exit 0
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Wait out cloud-init / unattended-upgrades apt locks.
+for i in $(seq 1 30); do
+  if ! pgrep -x apt    > /dev/null && \
+     ! pgrep -x apt-get > /dev/null && \
+     ! pgrep -x dpkg    > /dev/null; then
+    break
+  fi
+  echo "waiting for apt locks ($i/30)"
+  sleep 10
+done
+
+apt-get update
+apt-get install -y \
+  openjdk-8-jre-headless \
+  curl \
+  jq \
+  ca-certificates \
+  apt-transport-https \
+  lsb-release \
+  gnupg
+
+# Azure CLI
+curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+
+# CycleCloud repository + package
+curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+  | gpg --dearmor -o /etc/apt/trusted.gpg.d/microsoft.gpg
+echo "deb [arch=amd64] https://packages.microsoft.com/repos/cyclecloud $(lsb_release -cs) main" \
+  > /etc/apt/sources.list.d/cyclecloud.list
+
+apt-get update
+apt-get install -y cyclecloud8
+
+systemctl enable --now cycle_server
+
+mkdir -p "$(dirname "$DONE_MARKER")"
+touch "$DONE_MARKER"
+echo "install complete"
